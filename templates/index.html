@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Viral Edit Generator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 520px;
+      padding: 24px;
+    }
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: #fff;
+    }
+    .subtitle {
+      color: #888;
+      font-size: 0.85rem;
+      margin-bottom: 28px;
+    }
+    .flash {
+      background: #3a1c1c;
+      border: 1px solid #6b2c2c;
+      color: #f87171;
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-size: 0.85rem;
+    }
+    label {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #aaa;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+    }
+    .field { margin-bottom: 20px; }
+    .drop-zone {
+      border: 2px dashed #333;
+      border-radius: 10px;
+      padding: 28px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      color: #777;
+      font-size: 0.85rem;
+    }
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: #555;
+      background: #1a1a1a;
+    }
+    .drop-zone.has-files {
+      border-color: #4ade80;
+      background: #0f1f0f;
+      color: #4ade80;
+    }
+    .drop-zone input { display: none; }
+    .file-list {
+      margin-top: 8px;
+      font-size: 0.78rem;
+      color: #888;
+      max-height: 80px;
+      overflow-y: auto;
+    }
+    input[type="number"] {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: #1a1a1a;
+      color: #e0e0e0;
+      font-size: 0.9rem;
+      outline: none;
+    }
+    input[type="number"]:focus { border-color: #555; }
+    button {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 10px;
+      background: #fff;
+      color: #000;
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    button:hover { opacity: 0.85; }
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .spinner {
+      display: none;
+      text-align: center;
+      padding: 20px;
+      color: #888;
+      font-size: 0.85rem;
+    }
+    .spinner.active { display: block; }
+    .spinner .dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      background: #888;
+      border-radius: 50%;
+      margin: 0 3px;
+      animation: bounce 1.2s infinite;
+    }
+    .spinner .dot:nth-child(2) { animation-delay: 0.2s; }
+    .spinner .dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce {
+      0%, 80%, 100% { transform: translateY(0); }
+      40% { transform: translateY(-10px); }
+    }
+    .note {
+      margin-top: 16px;
+      text-align: center;
+      font-size: 0.75rem;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Viral Edit Generator</h1>
+    <p class="subtitle">Upload a clip + background images to create a viral TikTok/Reels edit</p>
+
+    {% with messages = get_flashed_messages() %}
+    {% if messages %}
+    {% for msg in messages %}
+    <div class="flash">{{ msg }}</div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    <form id="form" action="/generate" method="post" enctype="multipart/form-data">
+
+      <div class="field">
+        <label>Video Clip</label>
+        <div class="drop-zone" id="videoZone">
+          <span class="drop-text">Drop video here or click to browse</span>
+          <input type="file" name="video" accept="video/*" id="videoInput">
+          <div class="file-list" id="videoList"></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Background Images (2+)</label>
+        <div class="drop-zone" id="imageZone">
+          <span class="drop-text">Drop images here or click to browse</span>
+          <input type="file" name="images" accept="image/*" multiple id="imageInput">
+          <div class="file-list" id="imageList"></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Freeze Time (seconds)</label>
+        <input type="number" name="freeze" value="1.5" min="0.1" max="30" step="0.1">
+      </div>
+
+      <button type="submit" id="submitBtn">Generate Video</button>
+
+      <div class="spinner" id="spinner">
+        <div>
+          <span class="dot"></span>
+          <span class="dot"></span>
+          <span class="dot"></span>
+        </div>
+        <p style="margin-top:12px">Generating your edit&hellip; this takes a couple of minutes</p>
+      </div>
+    </form>
+
+    <p class="note">Output is 1080&times;1920 @ 30fps &middot; MP4 download</p>
+  </div>
+
+  <script>
+    function setupDropZone(zoneId, inputId, listId, multi) {
+      const zone = document.getElementById(zoneId);
+      const input = document.getElementById(inputId);
+      const list = document.getElementById(listId);
+
+      zone.addEventListener('click', () => input.click());
+      zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+      zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+      zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        input.files = e.dataTransfer.files;
+        updateList();
+      });
+      input.addEventListener('change', updateList);
+
+      function updateList() {
+        const files = input.files;
+        if (files.length > 0) {
+          zone.classList.add('has-files');
+          const names = Array.from(files).map(f => f.name);
+          if (multi) {
+            list.textContent = names.length + ' file' + (names.length > 1 ? 's' : '') + ': ' + names.join(', ');
+          } else {
+            list.textContent = names[0];
+          }
+        } else {
+          zone.classList.remove('has-files');
+          list.textContent = '';
+        }
+      }
+    }
+
+    setupDropZone('videoZone', 'videoInput', 'videoList', false);
+    setupDropZone('imageZone', 'imageInput', 'imageList', true);
+
+    document.getElementById('form').addEventListener('submit', function() {
+      document.getElementById('submitBtn').disabled = true;
+      document.getElementById('spinner').classList.add('active');
+    });
+  </script>
+</body>
+</html>

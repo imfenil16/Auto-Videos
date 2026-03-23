@@ -1,602 +1,630 @@
+#!/usr/bin/env python3
 """
-Soft Body Ring Drop Animation Generator
-========================================
-Recreates the @KAWAKEN_3DCG style soft body demo video.
-A transparent glossy ring drops over a wooden cone sculpture
-at varying softness percentages (0%, 10%, 25%, 50%, 80%, 100%).
+Viral Edit Video Generator
+==========================
+Creates the "play → freeze → cutout outline → dark animated background" style.
+
+Timeline:
+  Phase 1 — PLAY     (0 – freeze_t):  Video plays full-screen with zoom
+  Phase 2 — FREEZE   (freeze_t):      Frame freezes, subject highlighted on blurred bg
+  Phase 3 — REVEAL   (expanding):     Vertical window expands from center revealing slideshow
+  Phase 4 — LOOP     (rest):          Bg images cycle (Ken Burns, dark/grayscale, crossfade)
+
+Key style rules:
+  - Foreground = cutout with silhouette OUTLINE (not card/box)
+  - Subject is BOTTOM-ALIGNED (not centered)
+  - Foreground is STATIC (no breathing/floating/shake)
+  - Background provides all motion
 
 Usage:
-    blender --background --python generate_video.py
+  python generate_video.py -v clip.mp4 -i bg1.jpg bg2.jpg bg3.jpg
+  python generate_video.py -v clip.mp4 -i ./backgrounds/ --freeze 1.5 -o result.mp4
 
-Output:
-    - Individual clips in ./renders/soft_XX/
-    - Final stitched video: ./renders/final_output.mp4 (requires FFmpeg)
+Requirements:
+  pip install moviepy pillow numpy rembg opencv-python
 """
 
-import bpy
-import bmesh
+import argparse
 import math
 import os
-import subprocess
-import shutil
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-SOFTNESS_VALUES = [0, 10, 25, 50, 80, 100]
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "renders")
-RESOLUTION_X = 1080
-RESOLUTION_Y = 1920  # 9:16 vertical
-FPS = 30
-CLIP_DURATION_SEC = 5  # seconds per softness value
-SAMPLES = 64  # render samples (increase for quality, decrease for speed)
-USE_EEVEE = True  # True = fast, False = Cycles (slower but more realistic)
-
-
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
-def clean_scene():
-    """Remove all objects, materials, etc."""
-    bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete(use_global=False)
-
-    for mat in bpy.data.materials:
-        bpy.data.materials.remove(mat)
-    for mesh in bpy.data.meshes:
-        bpy.data.meshes.remove(mesh)
-    for cam in bpy.data.cameras:
-        bpy.data.cameras.remove(cam)
-    for light in bpy.data.lights:
-        bpy.data.lights.remove(light)
-    for txt in bpy.data.fonts:
-        if txt.name != "Bfont":
-            bpy.data.fonts.remove(txt)
-
-
-def set_render_settings(output_path):
-    """Configure render settings."""
-    scene = bpy.context.scene
-    scene.render.resolution_x = RESOLUTION_X
-    scene.render.resolution_y = RESOLUTION_Y
-    scene.render.resolution_percentage = 100
-    scene.render.fps = FPS
-    scene.frame_start = 1
-    scene.frame_end = CLIP_DURATION_SEC * FPS
-
-    if USE_EEVEE:
-        scene.render.engine = 'BLENDER_EEVEE_NEXT' if bpy.app.version >= (4, 0, 0) else 'BLENDER_EEVEE'
-        if hasattr(scene.eevee, 'taa_render_samples'):
-            scene.eevee.taa_render_samples = SAMPLES
-    else:
-        scene.render.engine = 'CYCLES'
-        scene.cycles.samples = SAMPLES
-        scene.cycles.device = 'GPU'
-
-    scene.render.image_settings.file_format = 'PNG'
-    scene.render.filepath = output_path + "/"
-
-    # Transparent background off — we want dark gray bg
-    scene.render.film_transparent = False
-
-
-# ============================================================
-# MATERIAL CREATION
-# ============================================================
-def create_wood_material():
-    """Create a realistic wood material using procedural textures."""
-    mat = bpy.data.materials.new(name="Wood")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    nodes.clear()
-
-    # Nodes
-    output = nodes.new('ShaderNodeOutputMaterial')
-    output.location = (600, 0)
-
-    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-    bsdf.location = (300, 0)
-    bsdf.inputs['Roughness'].default_value = 0.4
-    bsdf.inputs['Specular IOR Level'].default_value = 0.3 if bpy.app.version >= (4, 0, 0) else 0.3
-
-    # Wood color via noise + color ramp
-    noise = nodes.new('ShaderNodeTexNoise')
-    noise.location = (-200, 0)
-    noise.inputs['Scale'].default_value = 3.0
-    noise.inputs['Detail'].default_value = 6.0
-    noise.inputs['Distortion'].default_value = 2.0
-
-    mapping = nodes.new('ShaderNodeMapping')
-    mapping.location = (-400, 0)
-    mapping.inputs['Scale'].default_value = (1.0, 1.0, 8.0)
-
-    tex_coord = nodes.new('ShaderNodeTexCoord')
-    tex_coord.location = (-600, 0)
-
-    color_ramp = nodes.new('ShaderNodeValToRGB')
-    color_ramp.location = (0, 0)
-    # Light wood colors
-    color_ramp.color_ramp.elements[0].position = 0.3
-    color_ramp.color_ramp.elements[0].color = (0.65, 0.45, 0.25, 1.0)
-    color_ramp.color_ramp.elements[1].position = 0.7
-    color_ramp.color_ramp.elements[1].color = (0.85, 0.65, 0.40, 1.0)
-
-    # Links
-    links.new(tex_coord.outputs['Object'], mapping.inputs['Vector'])
-    links.new(mapping.outputs['Vector'], noise.inputs['Vector'])
-    links.new(noise.outputs['Fac'], color_ramp.inputs['Fac'])
-    links.new(color_ramp.outputs['Color'], bsdf.inputs['Base Color'])
-    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-
-    return mat
-
-
-def create_dark_wood_material():
-    """Darker wood for the base inset."""
-    mat = bpy.data.materials.new(name="DarkWood")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    nodes.clear()
-
-    output = nodes.new('ShaderNodeOutputMaterial')
-    output.location = (400, 0)
-
-    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-    bsdf.location = (200, 0)
-    bsdf.inputs['Base Color'].default_value = (0.35, 0.22, 0.12, 1.0)
-    bsdf.inputs['Roughness'].default_value = 0.5
-
-    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-    return mat
-
-
-def create_glass_material():
-    """Create a glossy transparent glass material for the ring."""
-    mat = bpy.data.materials.new(name="Glass")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    nodes.clear()
-
-    output = nodes.new('ShaderNodeOutputMaterial')
-    output.location = (400, 0)
-
-    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-    bsdf.location = (200, 0)
-    bsdf.inputs['Base Color'].default_value = (0.95, 0.95, 0.98, 1.0)
-    bsdf.inputs['Roughness'].default_value = 0.05
-    bsdf.inputs['IOR'].default_value = 1.45
-
-    # Transmission for glass look
-    if bpy.app.version >= (4, 0, 0):
-        bsdf.inputs['Transmission Weight'].default_value = 0.9
-    else:
-        bsdf.inputs['Transmission'].default_value = 0.9
-
-    bsdf.inputs['Alpha'].default_value = 0.85
-
-    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-
-    mat.blend_method = 'BLEND' if hasattr(mat, 'blend_method') else 'OPAQUE'
-    return mat
-
-
-# ============================================================
-# OBJECT CREATION
-# ============================================================
-def create_cone(name, radius_bottom, radius_top, height, location, material):
-    """Create a cone/truncated cone."""
-    bpy.ops.mesh.primitive_cone_add(
-        vertices=64,
-        radius1=radius_bottom,
-        radius2=radius_top,
-        depth=height,
-        location=location
-    )
-    obj = bpy.context.active_object
-    obj.name = name
-    bpy.ops.object.shade_smooth()
-    obj.data.materials.append(material)
-    return obj
-
-
-def create_sculpture(wood_mat, dark_wood_mat):
-    """Create the 3-tier wooden cone sculpture on a base."""
-    objects = []
-
-    # Base block (cube)
-    bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0.15))
-    base = bpy.context.active_object
-    base.name = "Base"
-    base.scale = (1.2, 1.2, 0.3)
-    bpy.ops.object.shade_smooth()
-    base.data.materials.append(wood_mat)
-    objects.append(base)
-
-    # Circular dark inset on top of base
-    bpy.ops.mesh.primitive_cylinder_add(
-        vertices=64, radius=0.85, depth=0.05,
-        location=(0, 0, 0.32)
-    )
-    inset = bpy.context.active_object
-    inset.name = "BaseInset"
-    bpy.ops.object.shade_smooth()
-    inset.data.materials.append(dark_wood_mat)
-    objects.append(inset)
-
-    # Bottom cone (largest)
-    bottom_cone = create_cone(
-        "BottomCone", 0.75, 0.50, 0.9,
-        (0, 0, 0.80), wood_mat
-    )
-    objects.append(bottom_cone)
-
-    # Middle cone
-    mid_cone = create_cone(
-        "MiddleCone", 0.50, 0.30, 0.7,
-        (0, 0, 1.60), wood_mat
-    )
-    objects.append(mid_cone)
-
-    # Top cone (smallest)
-    top_cone = create_cone(
-        "TopCone", 0.30, 0.05, 0.55,
-        (0, 0, 2.25), wood_mat
-    )
-    objects.append(top_cone)
-
-    return objects
-
-
-def create_ring(glass_mat, start_height=3.5):
-    """Create the torus ring."""
-    bpy.ops.mesh.primitive_torus_add(
-        major_radius=0.65,
-        minor_radius=0.08,
-        major_segments=64,
-        minor_segments=24,
-        location=(0, 0, start_height)
-    )
-    ring = bpy.context.active_object
-    ring.name = "Ring"
-    bpy.ops.object.shade_smooth()
-    ring.data.materials.append(glass_mat)
-    return ring
-
-
-# ============================================================
-# PHYSICS SETUP
-# ============================================================
-def setup_collision(obj):
-    """Add collision physics to an object."""
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.modifier_add(type='COLLISION')
-
-
-def setup_soft_body(ring, softness_pct):
-    """Add soft body physics to the ring with given softness."""
-    bpy.context.view_layer.objects.active = ring
-
-    # Remove existing soft body if any
-    for mod in ring.modifiers:
-        if mod.type == 'SOFT_BODY':
-            ring.modifiers.remove(mod)
-
-    bpy.ops.object.modifier_add(type='SOFT_BODY')
-    sb = ring.modifiers['Softbody'].settings
-
-    # Goal strength: higher = more rigid. Invert softness.
-    # Soft 0% = rigid (goal=1.0), Soft 100% = very soft (goal=0.0)
-    goal_strength = 1.0 - (softness_pct / 100.0)
-
-    sb.use_goal = True
-    sb.goal_spring = goal_strength
-    sb.goal_friction = 0.5
-
-    # Physics settings
-    sb.mass = 1.0
-    sb.friction = 0.5
-
-    # Spring settings for softness
-    sb.use_edges = True
-    sb.pull = 0.5 + (0.4 * (1.0 - softness_pct / 100.0))
-    sb.push = 0.5 + (0.4 * (1.0 - softness_pct / 100.0))
-
-    # Gravity
-    bpy.context.scene.gravity = (0, 0, -9.81)
-    bpy.context.scene.use_gravity = True
-
-
-def animate_ring_drop(ring, start_frame, end_frame, start_z=3.5, end_z=0.35):
-    """Animate the ring dropping from start_z to end_z."""
-    ring.location.z = start_z
-    ring.keyframe_insert(data_path="location", index=2, frame=start_frame)
-
-    ring.location.z = end_z
-    ring.keyframe_insert(data_path="location", index=2, frame=end_frame)
-
-    # Set easing
-    if ring.animation_data and ring.animation_data.action:
-        for fcurve in ring.animation_data.action.fcurves:
-            for kfp in fcurve.keyframe_points:
-                kfp.interpolation = 'BEZIER'
-                kfp.easing = 'EASE_IN'
-
-
-# ============================================================
-# SCENE SETUP
-# ============================================================
-def setup_camera():
-    """Set up the camera for vertical 9:16 view."""
-    bpy.ops.object.camera_add(
-        location=(4.5, -4.5, 2.2),
-        rotation=(math.radians(72), 0, math.radians(45))
-    )
-    cam = bpy.context.active_object
-    cam.name = "Camera"
-    cam.data.lens = 50
-    bpy.context.scene.camera = cam
-
-    # Track to center of sculpture
-    bpy.ops.object.constraint_add(type='TRACK_TO')
-    track = cam.constraints['Track To']
-    # Create an empty at the sculpture center for tracking
-    bpy.ops.object.empty_add(location=(0, 0, 1.3))
-    target = bpy.context.active_object
-    target.name = "CameraTarget"
-    track.target = target
-    track.track_axis = 'TRACK_NEGATIVE_Z'
-    track.up_axis = 'UP_Y'
-
-    # Re-select camera
-    bpy.context.view_layer.objects.active = cam
-    return cam
-
-
-def setup_lighting():
-    """Set up studio lighting."""
-    # Key light
-    bpy.ops.object.light_add(
-        type='AREA', location=(3, -2, 5),
-        rotation=(math.radians(45), 0, math.radians(20))
-    )
-    key = bpy.context.active_object
-    key.name = "KeyLight"
-    key.data.energy = 300
-    key.data.size = 3
-
-    # Fill light
-    bpy.ops.object.light_add(
-        type='AREA', location=(-3, -3, 3),
-        rotation=(math.radians(60), 0, math.radians(-30))
-    )
-    fill = bpy.context.active_object
-    fill.name = "FillLight"
-    fill.data.energy = 150
-    fill.data.size = 4
-
-    # Rim light
-    bpy.ops.object.light_add(
-        type='AREA', location=(-1, 4, 4),
-        rotation=(math.radians(40), 0, math.radians(180))
-    )
-    rim = bpy.context.active_object
-    rim.name = "RimLight"
-    rim.data.energy = 200
-    rim.data.size = 2
-
-
-def setup_background():
-    """Set world background to dark gray."""
-    world = bpy.data.worlds.get("World")
-    if not world:
-        world = bpy.data.worlds.new("World")
-    bpy.context.scene.world = world
-
-    world.use_nodes = True
-    nodes = world.node_tree.nodes
-    bg = nodes.get("Background")
-    if bg:
-        bg.inputs['Color'].default_value = (0.08, 0.08, 0.08, 1.0)
-        bg.inputs['Strength'].default_value = 1.0
-
-
-def create_title_text(text_content, location=(0, 0, 4.2)):
-    """Create 3D text for title overlay."""
-    bpy.ops.object.text_add(location=location)
-    txt = bpy.context.active_object
-    txt.name = "TitleText"
-    txt.data.body = text_content
-    txt.data.align_x = 'CENTER'
-    txt.data.align_y = 'CENTER'
-    txt.data.size = 0.35
-    txt.data.extrude = 0.02
-
-    # White emissive material so text is always visible
-    mat = bpy.data.materials.new(name="TextMaterial")
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    nodes.clear()
-
-    output = nodes.new('ShaderNodeOutputMaterial')
-    output.location = (300, 0)
-
-    emission = nodes.new('ShaderNodeEmission')
-    emission.location = (100, 0)
-    emission.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
-    emission.inputs['Strength'].default_value = 5.0
-
-    links.new(emission.outputs['Emission'], output.inputs['Surface'])
-
-    txt.data.materials.append(mat)
-
-    # Make text face camera
-    bpy.ops.object.constraint_add(type='TRACK_TO')
-    track = txt.constraints['Track To']
-    cam = bpy.data.objects.get("Camera")
-    if cam:
-        track.target = cam
-        track.track_axis = 'TRACK_Z'
-        track.up_axis = 'UP_Y'
-
-    return txt
-
-
-# ============================================================
-# BAKE & RENDER
-# ============================================================
-def bake_physics():
-    """Bake all physics simulations."""
-    bpy.ops.ptcache.bake_all(bake=True)
-
-
-def free_physics():
-    """Free all baked physics."""
-    bpy.ops.ptcache.free_bake_all()
-
-
-def render_clip(output_path):
-    """Render the current scene animation."""
-    os.makedirs(output_path, exist_ok=True)
-    bpy.context.scene.render.filepath = output_path + "/frame_"
-    bpy.ops.render.render(animation=True)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-def main():
-    print("=" * 60)
-    print("  Soft Body Ring Drop Video Generator")
-    print("=" * 60)
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    for softness in SOFTNESS_VALUES:
-        print(f"\n--- Generating Soft {softness}% ---")
-
-        # Clean everything
-        clean_scene()
-
-        # Materials
-        wood_mat = create_wood_material()
-        dark_wood_mat = create_dark_wood_material()
-        glass_mat = create_glass_material()
-
-        # Background
-        setup_background()
-
-        # Sculpture
-        sculpture_parts = create_sculpture(wood_mat, dark_wood_mat)
-
-        # Add collision to sculpture parts
-        for part in sculpture_parts:
-            setup_collision(part)
-
-        # Ring
-        ring = create_ring(glass_mat, start_height=3.5)
-
-        # Soft body physics
-        setup_soft_body(ring, softness)
-
-        # Animate ring drop
-        total_frames = CLIP_DURATION_SEC * FPS
-        animate_ring_drop(ring, start_frame=1, end_frame=total_frames,
-                          start_z=3.5, end_z=0.35)
-
-        # Title text
-        title = create_title_text(f"Soft {softness}%")
-
-        # Camera & lights
-        setup_camera()
-        setup_lighting()
-
-        # Render settings
-        clip_dir = os.path.join(OUTPUT_DIR, f"soft_{softness:03d}")
-        set_render_settings(clip_dir)
-
-        # Bake physics
-        try:
-            bake_physics()
-        except Exception as e:
-            print(f"  Physics bake note: {e}")
-
-        # Render
-        print(f"  Rendering to {clip_dir}")
-        render_clip(clip_dir)
-
-        # Free physics cache
-        try:
-            free_physics()
-        except Exception:
-            pass
-
-        print(f"  Done: Soft {softness}%")
-
-    # Stitch clips together using FFmpeg
-    stitch_videos()
-
-    print("\n" + "=" * 60)
-    print("  ALL DONE!")
-    print(f"  Output: {os.path.join(OUTPUT_DIR, 'final_output.mp4')}")
-    print("=" * 60)
-
-
-def stitch_videos():
-    """Use FFmpeg to combine all rendered clips into one video."""
-    print("\n--- Stitching clips with FFmpeg ---")
-
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        print("  FFmpeg not found! Skipping stitch.")
-        print("  Run stitch_videos.ps1 manually after installing FFmpeg.")
+import random
+import sys
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFilter
+
+try:
+    from moviepy.editor import VideoFileClip, VideoClip
+except ImportError:
+    try:
+        from moviepy import VideoFileClip, VideoClip
+    except ImportError:
+        print("Error: moviepy is required.\n  pip install moviepy")
+        sys.exit(1)
+
+try:
+    from rembg import remove as rembg_remove
+    HAS_REMBG = True
+except ImportError:
+    HAS_REMBG = False
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURATION — Tweak these to change the style
+# ═══════════════════════════════════════════════════════════════
+
+# Output
+OUTPUT_WIDTH  = 1080
+OUTPUT_HEIGHT = 1920        # 9:16 vertical
+FPS           = 30
+
+# Phase 1: Play video (before freeze)
+HOOK_ZOOM     = (1.0, 1.12) # scale range during pre-freeze playback
+
+# Phase 2→3: Freeze + reveal transition
+FREEZE_TIME         = 1.5   # seconds — when to freeze (overridable via --freeze)
+FREEZE_BG_BLUR      = 15    # blur radius for the frozen frame background
+FREEZE_HOLD         = 0.25  # seconds — hold on blurred bg before wipe starts
+REVEAL_DURATION     = 0.6   # seconds — expanding barn-door wipe from center
+WIPE_EDGE_WIDTH     = 3     # px — white separator line at wipe boundary
+WIPE_EDGE_FEATHER   = 6     # px — soft glow around wipe edge
+TEAR_AMPLITUDE      = 24    # px — how jagged the torn paper edge is
+TEAR_FREQUENCY      = 0.018 # how many bumps per pixel width
+FLASH_DURATION      = 0.12  # seconds — white flash on freeze
+FLASH_PEAK          = 0.20  # max flash opacity (0–1)
+SCALE_POP           = 1.05  # slight scale pop on cutout at freeze
+SCALE_POP_DURATION  = 0.20  # seconds — pop in/out
+
+# Subject shake (subtle vibration after freeze)
+SHAKE_AMPLITUDE     = 4     # max px offset
+SHAKE_FREQUENCY     = 8.0   # oscillations per second
+
+# Subject cutout (silhouette outline, NOT card/box)
+OUTLINE_THICKNESS   = 14    # white outline around subject silhouette (px) — bold & visible
+OUTLINE_FEATHER     = 1     # slight softness on outline edge (px)
+SHADOW_BLUR         = 10    # subtle drop shadow blur
+SHADOW_OPACITY      = 0.15  # subtle shadow opacity
+SHADOW_OFFSET_Y     = 5     # shadow Y offset
+
+# Background slideshow (dark cinematic style)
+BG_BLUR           = 5       # Gaussian blur radius (4–6, NOT too high)
+BG_DIM            = 0.45    # brightness multiplier
+BG_GRAYSCALE      = True    # grayscale for cinematic feel
+BG_IMAGE_DURATION = 0.6     # seconds per image
+BG_CROSSFADE      = 0.25    # crossfade between images
+BG_ZOOM           = (1.0, 1.12)  # Ken Burns zoom range
+BG_PAN_MAX        = 0.03    # max pan as fraction of image size
+
+# Vignette overlay
+VIGNETTE_STRENGTH = 0.30    # 0 = off, 1.0 = full black edges
+
+# Intensity phase (last portion of video)
+INTENSITY_RATIO    = 0.7    # kicks in at this fraction of total duration
+INTENSE_IMAGE_DUR  = 0.4    # faster switching
+INTENSE_ZOOM       = (1.0, 1.15)  # more aggressive zoom
+
+
+# ═══════════════════════════════════════════════════════════════
+# EASING
+# ═══════════════════════════════════════════════════════════════
+
+def ease_out(t):
+    """Cubic ease-out."""
+    return 1 - (1 - t) ** 3
+
+def ease_in_out(t):
+    """Cubic ease-in-out."""
+    return 4 * t ** 3 if t < 0.5 else 1 - (-2 * t + 2) ** 3 / 2
+
+def ease_in(t):
+    """Quadratic ease-in — starts slow, accelerates."""
+    return t * t
+
+
+# ═══════════════════════════════════════════════════════════════
+# TORN PAPER EDGE
+# ═══════════════════════════════════════════════════════════════
+
+def _build_tear_offsets(width, amplitude, frequency, seed=123):
+    """Generate a rough torn-paper offset curve for one horizontal edge."""
+    rng = random.Random(seed)
+    offsets = np.zeros(width, dtype=np.float32)
+    # Multi-octave: large slow waves + medium bumps + fine jagged noise
+    for x in range(width):
+        # Octave 1: slow undulation
+        o1 = math.sin(x * frequency * 2 * math.pi) * amplitude * 0.35
+        # Octave 2: medium bumps (3x frequency)
+        o2 = math.sin(x * frequency * 6 * math.pi + 1.7) * amplitude * 0.25
+        # Octave 3: fine jitter (9x frequency)
+        o3 = math.sin(x * frequency * 18 * math.pi + 3.1) * amplitude * 0.15
+        # Random noise
+        noise = rng.uniform(-amplitude * 0.35, amplitude * 0.35)
+        offsets[x] = o1 + o2 + o3 + noise
+    return offsets
+
+_tear_top = None
+_tear_bot = None
+
+def get_tear_offsets(width, amplitude, frequency):
+    """Cached torn-paper offsets for top and bottom edges."""
+    global _tear_top, _tear_bot
+    if _tear_top is None or len(_tear_top) != width:
+        _tear_top = _build_tear_offsets(width, amplitude, frequency, seed=101)
+        _tear_bot = _build_tear_offsets(width, amplitude, frequency, seed=202)
+    return _tear_top, _tear_bot
+
+
+# ═══════════════════════════════════════════════════════════════
+# IMAGE UTILITIES
+# ═══════════════════════════════════════════════════════════════
+
+def cover_resize(arr, w, h):
+    """Resize numpy image to cover (w, h), center-cropping any excess."""
+    src_h, src_w = arr.shape[:2]
+    scale = max(w / src_w, h / src_h)
+    nw = max(1, round(src_w * scale))
+    nh = max(1, round(src_h * scale))
+    resized = np.array(Image.fromarray(arr).resize((nw, nh), Image.LANCZOS))
+    x0 = (nw - w) // 2
+    y0 = (nh - h) // 2
+    crop = resized[max(0, y0):max(0, y0) + h, max(0, x0):max(0, x0) + w]
+    if crop.shape[0] != h or crop.shape[1] != w:
+        crop = np.array(Image.fromarray(crop).resize((w, h), Image.LANCZOS))
+    return crop
+
+
+def paste_rgba(canvas, overlay_rgba, x, y):
+    """Paste RGBA overlay onto RGB canvas using alpha compositing."""
+    ch, cw = canvas.shape[:2]
+    oh, ow = overlay_rgba.shape[:2]
+    sx, sy = max(0, -x), max(0, -y)
+    dx, dy = max(0, x), max(0, y)
+    pw = min(ow - sx, cw - dx)
+    ph = min(oh - sy, ch - dy)
+    if pw <= 0 or ph <= 0:
         return
+    src = overlay_rgba[sy:sy + ph, sx:sx + pw]
+    a = src[:, :, 3:4].astype(np.float32) / 255.0
+    rgb = src[:, :, :3].astype(np.float32)
+    dst = canvas[dy:dy + ph, dx:dx + pw].astype(np.float32)
+    canvas[dy:dy + ph, dx:dx + pw] = (rgb * a + dst * (1 - a)).astype(np.uint8)
 
-    concat_file = os.path.join(OUTPUT_DIR, "concat_list.txt")
 
-    # First, convert each frame sequence to a video clip
-    clip_paths = []
-    for softness in SOFTNESS_VALUES:
-        clip_dir = os.path.join(OUTPUT_DIR, f"soft_{softness:03d}")
-        clip_video = os.path.join(OUTPUT_DIR, f"clip_{softness:03d}.mp4")
-        clip_paths.append(clip_video)
-
-        cmd = [
-            ffmpeg_path, "-y",
-            "-framerate", str(FPS),
-            "-i", os.path.join(clip_dir, "frame_%04d.png"),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-crf", "18",
-            clip_video
-        ]
-        print(f"  Encoding clip: Soft {softness}%")
-        subprocess.run(cmd, capture_output=True)
-
-    # Create concat list
-    with open(concat_file, 'w') as f:
-        for path in clip_paths:
-            f.write(f"file '{path}'\n")
-
-    # Concatenate
-    final_output = os.path.join(OUTPUT_DIR, "final_output.mp4")
-    cmd = [
-        ffmpeg_path, "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_file,
-        "-c", "copy",
-        final_output
-    ]
-    print("  Concatenating all clips...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        print(f"  Final video: {final_output}")
+def paste(canvas, overlay, x, y, alpha=None):
+    """Paste overlay onto canvas at (x, y) with optional alpha mask."""
+    ch, cw = canvas.shape[:2]
+    oh, ow = overlay.shape[:2]
+    sx, sy = max(0, -x), max(0, -y)
+    dx, dy = max(0, x), max(0, y)
+    pw = min(ow - sx, cw - dx)
+    ph = min(oh - sy, ch - dy)
+    if pw <= 0 or ph <= 0:
+        return
+    if alpha is not None:
+        a = alpha[sy:sy + ph, sx:sx + pw, np.newaxis]
+        dst = canvas[dy:dy + ph, dx:dx + pw].astype(np.float32)
+        src = overlay[sy:sy + ph, sx:sx + pw].astype(np.float32)
+        canvas[dy:dy + ph, dx:dx + pw] = (src * a + dst * (1 - a)).astype(np.uint8)
     else:
-        print(f"  FFmpeg concat error: {result.stderr}")
+        canvas[dy:dy + ph, dx:dx + pw] = overlay[sy:sy + ph, sx:sx + pw]
 
 
-if __name__ == "__main__":
+# ═══════════════════════════════════════════════════════════════
+# CUTOUT + SILHOUETTE OUTLINE BUILDER
+# ═══════════════════════════════════════════════════════════════
+
+def remove_background(frame_rgb):
+    """Remove background from a video frame using rembg. Returns RGBA numpy array."""
+    if not HAS_REMBG:
+        print("Error: rembg is required for background removal.\n  pip install rembg")
+        sys.exit(1)
+    pil_img = Image.fromarray(frame_rgb)
+    result = rembg_remove(pil_img)  # returns RGBA PIL Image
+    return np.array(result)
+
+
+def clean_mask(alpha):
+    """Hard-threshold alpha to remove soft leftover background edges."""
+    return np.where(alpha > 200, 255, 0).astype(np.uint8)
+
+
+def build_outlined_cutout(cutout_rgba, outline_px, feather_px,
+                          shadow_blur, shadow_opacity, shadow_offset_y):
+    """
+    Build subject cutout with white silhouette outline + subtle drop shadow.
+    Uses mask dilation (not rectangle border).
+    Returns RGBA numpy array.
+    """
+    import cv2
+
+    h, w = cutout_rgba.shape[:2]
+    alpha = cutout_rgba[:, :, 3].copy()
+    alpha = clean_mask(alpha)
+    rgb = cutout_rgba[:, :, :3]
+
+    # Pad everything to fit outline + shadow
+    pad = outline_px + shadow_blur + abs(shadow_offset_y) + feather_px
+    pw, ph = w + 2 * pad, h + 2 * pad
+
+    # ── Dilate mask to create outline region ──
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (outline_px * 2 + 1, outline_px * 2 + 1))
+    dilated = cv2.dilate(alpha, kernel, iterations=1)
+
+    # Outline = dilated - original mask
+    outline_mask = np.clip(dilated.astype(np.int16) - alpha.astype(np.int16), 0, 255).astype(np.uint8)
+
+    # Optional feather on the outline outer edge
+    if feather_px > 0:
+        outline_mask = cv2.GaussianBlur(outline_mask, (0, 0), feather_px)
+
+    # ── Build output image (padded) ──
+    result = np.zeros((ph, pw, 4), dtype=np.uint8)
+
+    # Drop shadow: dilated mask shifted down, blurred, at low opacity
+    shadow_layer = np.zeros((ph, pw), dtype=np.float32)
+    sy = pad + shadow_offset_y
+    sx = pad
+    shadow_layer[sy:sy + h, sx:sx + w] = dilated.astype(np.float32) / 255.0
+    shadow_layer = cv2.GaussianBlur(shadow_layer, (0, 0), shadow_blur)
+    shadow_alpha = (shadow_layer * shadow_opacity * 255).clip(0, 255).astype(np.uint8)
+    result[:, :, 3] = np.maximum(result[:, :, 3], shadow_alpha)
+    # shadow is black (rgb stays 0)
+
+    # White outline
+    result[pad:pad + h, pad:pad + w, 0] = np.maximum(
+        result[pad:pad + h, pad:pad + w, 0], outline_mask)
+    result[pad:pad + h, pad:pad + w, 1] = np.maximum(
+        result[pad:pad + h, pad:pad + w, 1], outline_mask)
+    result[pad:pad + h, pad:pad + w, 2] = np.maximum(
+        result[pad:pad + h, pad:pad + w, 2], outline_mask)
+    result[pad:pad + h, pad:pad + w, 3] = np.maximum(
+        result[pad:pad + h, pad:pad + w, 3], outline_mask)
+
+    # Subject on top
+    subj_alpha = alpha.astype(np.float32) / 255.0
+    for c in range(3):
+        existing = result[pad:pad + h, pad:pad + w, c].astype(np.float32)
+        result[pad:pad + h, pad:pad + w, c] = (
+            rgb[:, :, c].astype(np.float32) * subj_alpha +
+            existing * (1 - subj_alpha)
+        ).astype(np.uint8)
+    result[pad:pad + h, pad:pad + w, 3] = np.maximum(
+        result[pad:pad + h, pad:pad + w, 3], alpha)
+
+    # Do NOT trim/crop — keep full canvas so subject stays at original position
+    return result
+
+
+_vignette_cache = {}
+
+def vignette_overlay(w, h, strength):
+    """Pre-compute darkening vignette (radial gradient), cached."""
+    key = (w, h, int(strength * 100))
+    if key not in _vignette_cache:
+        Y, X = np.ogrid[:h, :w]
+        cx, cy = w / 2, h / 2
+        r = np.sqrt(((X - cx) / cx) ** 2 + ((Y - cy) / cy) ** 2)
+        v = np.clip(r - 0.5, 0, 1) * strength
+        _vignette_cache[key] = v.astype(np.float32)
+    return _vignette_cache[key]
+
+
+# ═══════════════════════════════════════════════════════════════
+# BACKGROUND ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def load_bg_image(path, out_size, blur, dim, grayscale, max_zoom):
+    """Load, process (grayscale, blur, dim), and oversize one background image."""
+    ow, oh = out_size
+    margin = max_zoom * 1.2
+    img = Image.open(path).convert('RGB')
+    if grayscale:
+        img = img.convert('L').convert('RGB')
+    if blur > 0:
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+    tw, th = int(ow * margin), int(oh * margin)
+    ratio = img.width / img.height
+    tr = tw / th
+    if ratio > tr:
+        nw, nh = int(th * ratio), th
+    else:
+        nw, nh = tw, int(tw / ratio)
+    img = img.resize((nw, nh), Image.LANCZOS)
+    arr = (np.array(img, dtype=np.float32) * dim).clip(0, 255).astype(np.uint8)
+    return arr
+
+
+def build_schedule(start, total_dur, n_images, seed=42):
+    """Pre-compute the background image timeline (deterministic)."""
+    rng = random.Random(seed)
+    entries = []
+    t, idx = start, 0
+    intensity_t = total_dur * INTENSITY_RATIO
+    while t < total_dur:
+        intense = t >= intensity_t
+        dur = INTENSE_IMAGE_DUR if intense else BG_IMAGE_DURATION
+        zr = INTENSE_ZOOM if intense else BG_ZOOM
+        zoom = zr if rng.random() > 0.5 else (zr[1], zr[0])
+        pan = (rng.uniform(-BG_PAN_MAX, BG_PAN_MAX),
+               rng.uniform(-BG_PAN_MAX, BG_PAN_MAX))
+        entries.append(dict(start=t, end=t + dur, dur=dur,
+                            img=idx % n_images, zoom=zoom, pan=pan))
+        t += dur - BG_CROSSFADE
+        idx += 1
+    return entries
+
+
+def kb_frame(img, t, dur, out_size, zoom, pan):
+    """Render one Ken-Burns frame (zoom + pan on still image)."""
+    ow, oh = out_size
+    ih, iw = img.shape[:2]
+    p = min(1.0, t / max(dur, 1e-6))
+    z = zoom[0] + (zoom[1] - zoom[0]) * p
+    crop_h = int(ih / z)
+    crop_w = int(crop_h * (ow / oh))
+    crop_w, crop_h = min(crop_w, iw), min(crop_h, ih)
+    cx = iw // 2 + int(pan[0] * iw * p)
+    cy = ih // 2 + int(pan[1] * ih * p)
+    x1 = max(0, min(cx - crop_w // 2, iw - crop_w))
+    y1 = max(0, min(cy - crop_h // 2, ih - crop_h))
+    crop = img[y1:y1 + crop_h, x1:x1 + crop_w]
+    return np.array(Image.fromarray(crop).resize((ow, oh), Image.LANCZOS))
+
+
+def bg_at(t, schedule, images, out_size):
+    """Background frame at time t, with stacking slide-in between images."""
+    active = [e for e in schedule if e['start'] <= t < e['end']]
+    if not active:
+        e = schedule[-1]
+        return kb_frame(images[e['img']], t - e['start'],
+                        e['dur'], out_size, e['zoom'], e['pan'])
+    if len(active) == 1:
+        e = active[0]
+        return kb_frame(images[e['img']], t - e['start'],
+                        e['dur'], out_size, e['zoom'], e['pan'])
+    # Stacking transition: new image slides in from top over old one
+    f0 = kb_frame(images[active[0]['img']], t - active[0]['start'],
+                  active[0]['dur'], out_size, active[0]['zoom'], active[0]['pan'])
+    f1 = kb_frame(images[active[1]['img']], t - active[1]['start'],
+                  active[1]['dur'], out_size, active[1]['zoom'], active[1]['pan'])
+    a = min(1.0, (t - active[1]['start']) / BG_CROSSFADE)
+    p = ease_out(a)
+    ow, oh = out_size
+    # Slide new image from top: starts at -oh, ends at 0
+    offset_y = int(oh * (1 - p))
+    canvas = f0.copy()
+    if offset_y < oh:
+        visible = oh - offset_y
+        canvas[0:visible, :] = f1[offset_y:offset_y + visible, :]
+    return canvas
+
+
+# ═══════════════════════════════════════════════════════════════
+# VIDEO GENERATOR
+# ═══════════════════════════════════════════════════════════════
+
+def generate(video_path, image_paths, output_path, freeze_time=None, seed=42):
+    ow, oh = OUTPUT_WIDTH, OUTPUT_HEIGHT
+    out_size = (ow, oh)
+    ft = freeze_time if freeze_time is not None else FREEZE_TIME
+
+    print(f"[1/6] Loading video: {video_path}")
+    video = VideoFileClip(video_path)
+    total = video.duration
+    ft = min(ft, total - 0.1)  # clamp freeze time
+
+    print(f"[2/6] Extracting freeze frame at t={ft:.2f}s...")
+    freeze_rgb = video.get_frame(ft)
+    freeze_rgb = cover_resize(freeze_rgb, ow, oh)
+
+    print("[3/6] Removing background (subject cutout)...")
+    cutout_rgba = remove_background(freeze_rgb)
+
+    print("[4/6] Building outlined cutout...")
+    fg_rgba = build_outlined_cutout(cutout_rgba, OUTLINE_THICKNESS, OUTLINE_FEATHER,
+                                     SHADOW_BLUR, SHADOW_OPACITY, SHADOW_OFFSET_Y)
+
+    # Position at (0,0) — NO repositioning, NO scaling
+    # The cutout is full-canvas size so subject stays exactly where it was in the video
+    fg_h, fg_w = fg_rgba.shape[:2]
+    fg_x = (ow - fg_w) // 2   # center the padded canvas (padding is symmetric)
+    fg_y = (oh - fg_h) // 2
+
+    # Build blurred freeze frame (background for reveal phase)
+    print("[5/7] Building blurred freeze background...")
+    blur_freeze = np.array(
+        Image.fromarray(freeze_rgb).filter(
+            ImageFilter.GaussianBlur(radius=FREEZE_BG_BLUR)
+        )
+    )
+    # Keep it brighter than the slideshow so the wipe boundary is clearly visible
+    blur_freeze = (blur_freeze.astype(np.float32) * 0.70).clip(0, 255).astype(np.uint8)
+
+    print(f"[6/7] Loading {len(image_paths)} background images (dark cinematic)...")
+    max_z = max(BG_ZOOM[1], INTENSE_ZOOM[1])
+    bg_imgs = [load_bg_image(p, out_size, BG_BLUR, BG_DIM, BG_GRAYSCALE, max_z)
+               for p in image_paths]
+
+    print("[7/7] Building timeline & rendering...")
+    sched = build_schedule(ft, total, len(bg_imgs), seed)
+    vig = vignette_overlay(ow, oh, VIGNETTE_STRENGTH) if VIGNETTE_STRENGTH > 0 else None
+    wipe_duration = total - ft - FREEZE_HOLD  # wipe spans rest of video
+
+    def make_frame(t):
+        # ═══ Phase 1: Play video full-screen (before freeze) ═══
+        if t < ft:
+            p = t / ft
+            s = HOOK_ZOOM[0] + (HOOK_ZOOM[1] - HOOK_ZOOM[0]) * ease_out(p)
+            cw_f = max(1, int(ow * s))
+            ch_f = max(1, int(oh * s))
+            frame = cover_resize(video.get_frame(t), cw_f, ch_f)
+            canvas = np.zeros((oh, ow, 3), dtype=np.uint8)
+            x = (ow - cw_f) // 2
+            y = (oh - ch_f) // 2
+            paste(canvas, frame, x, y)
+            return canvas
+
+        # ═══ Time since freeze ═══
+        dt = t - ft
+
+        # ── Animated slideshow background (always computed) ──
+        slideshow_bg = bg_at(t, sched, bg_imgs, out_size)
+        if vig is not None:
+            slideshow_bg = (slideshow_bg.astype(np.float32) *
+                            (1 - vig[:, :, np.newaxis])).clip(0, 255).astype(np.uint8)
+
+        # ═══ Phase 2: Freeze + highlight on blurred bg ═══
+        if dt < FREEZE_HOLD:
+            # Hold on blurred freeze frame (subject highlighted, no wipe yet)
+            canvas = blur_freeze.copy()
+
+            # White flash effect (brief pop on freeze)
+            if dt < FLASH_DURATION:
+                flash_p = dt / FLASH_DURATION
+                flash_alpha = FLASH_PEAK * (1.0 - abs(2.0 * flash_p - 1.0))
+                canvas = (canvas.astype(np.float32) * (1 - flash_alpha) +
+                          255.0 * flash_alpha).clip(0, 255).astype(np.uint8)
+
+        # ═══ Phase 3: Barn-door wipe — center-out vertical expand (rest of video) ═══
+        else:
+            canvas = blur_freeze.copy()
+
+            # Wipe progress (0→1) — ease-in: starts slow then accelerates
+            wipe_t = dt - FREEZE_HOLD
+            progress = min(1.0, wipe_t / max(wipe_duration, 0.1))
+
+            # Growing strip from center
+            half_h = int((oh / 2) * progress)
+            center = oh // 2
+            top_base = max(0, center - half_h)
+            bot_base = min(oh, center + half_h)
+
+            if top_base < bot_base:
+                # Get torn paper offsets (vectorized)
+                tear_top, tear_bot = get_tear_offsets(ow, TEAR_AMPLITUDE, TEAR_FREQUENCY)
+                tear_scale = min(progress * 3, 1.0)
+
+                # Build per-column top/bottom arrays
+                col_tops = np.clip((top_base + (tear_top * tear_scale)).astype(np.int32), 0, oh)
+                col_bots = np.clip((bot_base + (tear_bot * tear_scale)).astype(np.int32), 0, oh)
+
+                # Build 2D mask: row_indices (oh, 1) vs col_tops/col_bots (1, ow)
+                rows = np.arange(oh)[:, np.newaxis]  # (oh, 1)
+                mask = (rows >= col_tops[np.newaxis, :]) & (rows < col_bots[np.newaxis, :])  # (oh, ow)
+
+                # Apply mask: copy slideshow pixels where mask is True
+                mask3 = mask[:, :, np.newaxis]  # (oh, ow, 1)
+                np.copyto(canvas, slideshow_bg, where=mask3)
+
+                # Edge glow: thin bright line along torn edges
+                if progress < 0.95:
+                    glow_w = WIPE_EDGE_WIDTH
+                    # Top edge glow band
+                    top_lo = np.clip(col_tops - glow_w, 0, oh).astype(np.int32)
+                    top_hi = np.clip(col_tops + glow_w, 0, oh).astype(np.int32)
+                    top_mask = (rows >= top_lo[np.newaxis, :]) & (rows < top_hi[np.newaxis, :])
+                    # Bottom edge glow band
+                    bot_lo = np.clip(col_bots - glow_w, 0, oh).astype(np.int32)
+                    bot_hi = np.clip(col_bots + glow_w, 0, oh).astype(np.int32)
+                    bot_mask = (rows >= bot_lo[np.newaxis, :]) & (rows < bot_hi[np.newaxis, :])
+                    edge_mask = (top_mask | bot_mask)[:, :, np.newaxis]
+                    canvas = np.where(edge_mask,
+                                      np.minimum(canvas.astype(np.int16) + 120, 255).astype(np.uint8),
+                                      canvas)
+
+        # ── Subject cutout (always on top, with subtle shake) ──
+        # Scale pop: brief 1.0 → 1.05 → 1.0 ease on freeze
+        if 0 < dt < SCALE_POP_DURATION:
+            pop_p = dt / SCALE_POP_DURATION
+            pop_s = 1.0 + (SCALE_POP - 1.0) * (1.0 - abs(2.0 * pop_p - 1.0))
+            pop_h = int(fg_rgba.shape[0] * pop_s)
+            pop_w = int(fg_rgba.shape[1] * pop_s)
+            popped = np.array(Image.fromarray(fg_rgba).resize((pop_w, pop_h), Image.LANCZOS))
+            px = fg_x - (pop_w - fg_rgba.shape[1]) // 2
+            py = fg_y - (pop_h - fg_rgba.shape[0]) // 2
+            paste_rgba(canvas, popped, px, py)
+        else:
+            # Subtle shake: sinusoidal x/y jitter
+            shake_x = int(SHAKE_AMPLITUDE * math.sin(dt * SHAKE_FREQUENCY * 2 * math.pi))
+            shake_y = int(SHAKE_AMPLITUDE * math.cos(dt * SHAKE_FREQUENCY * 2.7 * math.pi) * 0.6)
+            paste_rgba(canvas, fg_rgba, fg_x + shake_x, fg_y + shake_y)
+
+        return canvas
+
+    print(f"     Rendering {total:.1f}s @ {FPS}fps -> {output_path}")
+    result = VideoClip(make_frame, duration=total)
+    if video.audio:
+        if hasattr(result, 'with_audio'):
+            result = result.with_audio(video.audio)
+        else:
+            result = result.set_audio(video.audio)
+    result.write_videofile(output_path, fps=FPS, codec='libx264',
+                           audio_codec='aac', bitrate='8000k', logger='bar')
+    video.close()
+    print(f"\nDone! -> {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════
+
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'}
+
+def collect_images(paths):
+    """Expand directories and validate image paths."""
+    images = []
+    for p in paths:
+        if os.path.isdir(p):
+            for f in sorted(os.listdir(p)):
+                if os.path.splitext(f)[1].lower() in IMAGE_EXTS:
+                    images.append(os.path.join(p, f))
+        elif os.path.isfile(p):
+            images.append(p)
+        else:
+            print(f"Warning: '{p}' not found, skipping")
+    return images
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Viral Edit Video Generator — Premium Edition',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python generate_video.py -v clip.mp4 -i bg1.jpg bg2.jpg bg3.jpg
+  python generate_video.py -v clip.mp4 -i ./backgrounds/ -o result.mp4
+  python generate_video.py -v clip.mp4 -i ./backgrounds/ --freeze 2.0 --seed 123
+""")
+    parser.add_argument('-v', '--video', required=True, help='Foreground video file')
+    parser.add_argument('-i', '--images', required=True, nargs='+',
+                        help='Background images (files and/or a directory)')
+    parser.add_argument('-o', '--output', default='output.mp4', help='Output video path')
+    parser.add_argument('--freeze', type=float, default=None,
+                        help=f'Freeze frame time in seconds (default: {FREEZE_TIME})')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.video):
+        print(f"Error: video not found: {args.video}")
+        sys.exit(1)
+
+    if not HAS_REMBG:
+        print("Error: rembg is required for background removal.")
+        print("  pip install rembg")
+        sys.exit(1)
+
+    images = collect_images(args.images)
+    if not images:
+        print("Error: no valid background images found")
+        sys.exit(1)
+
+    print(f"Video:  {args.video}")
+    print(f"Images: {len(images)} files")
+    print(f"Freeze: {args.freeze or FREEZE_TIME}s")
+    print(f"Output: {args.output}\n")
+
+    generate(args.video, images, args.output, args.freeze, args.seed)
+
+
+if __name__ == '__main__':
     main()

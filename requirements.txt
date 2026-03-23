@@ -1,0 +1,6 @@
+moviepy>=2.0
+pillow
+numpy
+rembg
+opencv-python-headless
+flask

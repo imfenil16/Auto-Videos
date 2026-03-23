@@ -1,0 +1,25 @@
+# Media files
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.tiff
+
+# Directories
+uploads/
+outputs/
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Legacy
+stitch_videos.ps1
