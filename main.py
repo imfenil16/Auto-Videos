@@ -99,8 +99,12 @@ def generate_video():
         output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
 
         # Generate
-        generate(video_path, image_paths, output_path, freeze_time=freeze_time,
-                duration=duration)
+        try:
+            generate(video_path, image_paths, output_path, freeze_time=freeze_time,
+                    duration=duration)
+        except Exception as e:
+            flash(f"Generation failed: {e}", "error")
+            return redirect(url_for("index"))
 
         return send_file(output_path, as_attachment=True, download_name="viral_edit.mp4")
 

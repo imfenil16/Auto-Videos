@@ -216,8 +216,7 @@ def paste(canvas, overlay, x, y, alpha=None):
 def remove_background(frame_rgb):
     """Remove background from a video frame using rembg. Returns RGBA numpy array."""
     if not HAS_REMBG:
-        print("Error: rembg is required for background removal.\n  pip install rembg")
-        sys.exit(1)
+        raise RuntimeError("rembg is required for background removal. pip install rembg")
     pil_img = Image.fromarray(frame_rgb)
     result = rembg_remove(pil_img)  # returns RGBA PIL Image
     return np.array(result)

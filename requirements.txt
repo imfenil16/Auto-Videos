@@ -2,6 +2,7 @@ moviepy>=2.0
 pillow
 numpy
 rembg
+onnxruntime
 opencv-python-headless
 flask
 gunicorn
