@@ -4,3 +4,4 @@ numpy
 rembg
 opencv-python-headless
 flask
+gunicorn

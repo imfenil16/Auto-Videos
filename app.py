@@ -100,6 +100,7 @@ def generate_video():
 if __name__ == "__main__":
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print("\n  Viral Edit Generator")
-    print("  http://localhost:5000\n")
-    app.run(debug=False, port=5000)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"\n  Viral Edit Generator")
+    print(f"  http://localhost:{port}\n")
+    app.run(host="0.0.0.0", debug=False, port=port)
