@@ -64,6 +64,17 @@ def generate_video():
     except ValueError:
         freeze_time = 1.5
 
+    # Duration (optional — None means full video length)
+    duration = None
+    duration_str = request.form.get("duration", "").strip()
+    if duration_str:
+        try:
+            duration = float(duration_str)
+            if duration <= 0:
+                duration = None
+        except ValueError:
+            duration = None
+
     # Create job directory
     job_id = uuid.uuid4().hex[:10]
     job_dir = os.path.join(UPLOAD_DIR, job_id)
@@ -88,7 +99,8 @@ def generate_video():
         output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
 
         # Generate
-        generate(video_path, image_paths, output_path, freeze_time=freeze_time)
+        generate(video_path, image_paths, output_path, freeze_time=freeze_time,
+                duration=duration)
 
         return send_file(output_path, as_attachment=True, download_name="viral_edit.mp4")
 

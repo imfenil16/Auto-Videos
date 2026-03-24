@@ -404,7 +404,7 @@ def bg_at(t, schedule, images, out_size):
 # VIDEO GENERATOR
 # ═══════════════════════════════════════════════════════════════
 
-def generate(video_path, image_paths, output_path, freeze_time=None, seed=42):
+def generate(video_path, image_paths, output_path, freeze_time=None, duration=None, seed=42):
     ow, oh = OUTPUT_WIDTH, OUTPUT_HEIGHT
     out_size = (ow, oh)
     ft = freeze_time if freeze_time is not None else FREEZE_TIME
@@ -412,6 +412,8 @@ def generate(video_path, image_paths, output_path, freeze_time=None, seed=42):
     print(f"[1/6] Loading video: {video_path}")
     video = VideoFileClip(video_path)
     total = video.duration
+    if duration is not None and 0 < duration < total:
+        total = duration
     ft = min(ft, total - 0.1)  # clamp freeze time
 
     print(f"[2/6] Extracting freeze frame at t={ft:.2f}s...")
@@ -555,10 +557,11 @@ def generate(video_path, image_paths, output_path, freeze_time=None, seed=42):
     print(f"     Rendering {total:.1f}s @ {FPS}fps -> {output_path}")
     result = VideoClip(make_frame, duration=total)
     if video.audio:
+        audio = video.audio.subclipped(0, total) if hasattr(video.audio, 'subclipped') else video.audio.subclip(0, total)
         if hasattr(result, 'with_audio'):
-            result = result.with_audio(video.audio)
+            result = result.with_audio(audio)
         else:
-            result = result.set_audio(video.audio)
+            result = result.set_audio(audio)
     result.write_videofile(output_path, fps=FPS, codec='libx264',
                            audio_codec='aac', bitrate='8000k', logger='bar')
     video.close()
@@ -601,6 +604,8 @@ def main():
     parser.add_argument('-o', '--output', default='output.mp4', help='Output video path')
     parser.add_argument('--freeze', type=float, default=None,
                         help=f'Freeze frame time in seconds (default: {FREEZE_TIME})')
+    parser.add_argument('--duration', type=float, default=None,
+                        help='Output video duration in seconds (default: full video length)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     args = parser.parse_args()
 
@@ -621,9 +626,11 @@ def main():
     print(f"Video:  {args.video}")
     print(f"Images: {len(images)} files")
     print(f"Freeze: {args.freeze or FREEZE_TIME}s")
+    if args.duration:
+        print(f"Duration: {args.duration}s")
     print(f"Output: {args.output}\n")
 
-    generate(args.video, images, args.output, args.freeze, args.seed)
+    generate(args.video, images, args.output, args.freeze, args.duration, args.seed)
 
 
 if __name__ == '__main__':
